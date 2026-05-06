@@ -10,11 +10,11 @@ import random
 import re
 import shutil
 import string
-import subprocess
+
 import sys
 import time
-from urllib.request import urlopen
-from urllib.request import urlretrieve
+import requests
+import tempfile
 import zipfile
 from multiprocessing import Lock
 
@@ -236,7 +236,7 @@ class Patcher(object):
             path += f"_{self.version_main}"
         path = path.upper()
         logger.debug("getting release number from %s" % path)
-        return LooseVersion(urlopen(self.url_repo + path).read().decode())
+        return LooseVersion(requests.get(self.url_repo + path, timeout=30).text.strip())
 
     def parse_exe_version(self):
         with io.open(self.executable_path, "rb") as f:
@@ -254,7 +254,11 @@ class Patcher(object):
         u = "%s/%s/%s" % (self.url_repo, self.version_full.vstring, self.zip_name)
         logger.debug("downloading from %s" % u)
         # return urlretrieve(u, filename=self.data_path)[0]
-        return urlretrieve(u)[0]
+        response = requests.get(u, timeout=60)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+        tmp.write(response.content)
+        tmp.close()
+        return tmp.name
 
     def unzip_package(self, fp):
         """
@@ -268,13 +272,13 @@ class Patcher(object):
         except (FileNotFoundError, OSError):
             pass
 
-        os.makedirs(self.zip_path, mode=0o755, exist_ok=True)
+        os.makedirs(self.zip_path, mode=0o644, exist_ok=True)
         with zipfile.ZipFile(fp, mode="r") as zf:
             zf.extract(self.exe_name, self.zip_path)
         os.rename(os.path.join(self.zip_path, self.exe_name), self.executable_path)
         os.remove(fp)
         os.rmdir(self.zip_path)
-        os.chmod(self.executable_path, 0o755)
+        os.chmod(self.executable_path, 0o644)
         return self.executable_path
 
     @staticmethod
@@ -285,11 +289,46 @@ class Patcher(object):
 
         :return: True on success else False
         """
+        import signal
         exe_name = os.path.basename(exe_name)
+        r = 1
         if IS_POSIX:
-            r = os.system("kill -f -9 $(pidof %s)" % exe_name)
+            if os.path.isdir("/proc"):
+                for pid_dir in os.listdir("/proc"):
+                    if not pid_dir.isdigit():
+                        continue
+                    try:
+                        with open(os.path.join("/proc", pid_dir, "comm")) as fh:
+                            if fh.read().strip() == exe_name:
+                                os.kill(int(pid_dir), signal.SIGKILL)
+                                r = 0
+                    except (OSError, ProcessLookupError):
+                        pass
         else:
-            r = os.system("taskkill /f /im %s" % exe_name)
+            import ctypes
+            class PROCESSENTRY32(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", ctypes.c_uint32), ("cntUsage", ctypes.c_uint32),
+                    ("th32ProcessID", ctypes.c_uint32),
+                    ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                    ("th32ModuleID", ctypes.c_uint32), ("cntThreads", ctypes.c_uint32),
+                    ("th32ParentProcessID", ctypes.c_uint32),
+                    ("pcPriClassBase", ctypes.c_long), ("dwFlags", ctypes.c_uint32),
+                    ("szExeFile", ctypes.c_char * 260),
+                ]
+            snap = ctypes.windll.kernel32.CreateToolhelp32Snapshot(0x2, 0)
+            entry = PROCESSENTRY32(dwSize=ctypes.sizeof(PROCESSENTRY32))
+            if ctypes.windll.kernel32.Process32First(snap, ctypes.byref(entry)):
+                while True:
+                    if entry.szExeFile.decode("utf-8", errors="ignore") == exe_name:
+                        h = ctypes.windll.kernel32.OpenProcess(0x1, False, entry.th32ProcessID)
+                        if h:
+                            ctypes.windll.kernel32.TerminateProcess(h, 1)
+                            ctypes.windll.kernel32.CloseHandle(h)
+                            r = 0
+                    if not ctypes.windll.kernel32.Process32Next(snap, ctypes.byref(entry)):
+                        break
+            ctypes.windll.kernel32.CloseHandle(snap)
         return not r
 
     @staticmethod
