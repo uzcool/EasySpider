@@ -315,35 +315,83 @@ def write_to_csv(file_name, data, record):
             f_csv.writerow(to_write)
         f.close()
 
+def _substitute_fields_as_python_literal(text, outputParameters):
+    """Replace Field["x"] tokens inside a Python expression with safe repr() literals.
+
+    Scraped values are user-controlled and must NEVER be interpolated as raw
+    source code into an eval() expression — that is arbitrary code execution
+    (CWE-95). Wrapping the value with repr() turns the substitution into a
+    well-formed Python string literal that cannot break out of its quoting.
+    """
+    field_pat = re.compile(r'Field\["([^"]+)"\]')
+    return field_pat.sub(
+        lambda m: repr(str(outputParameters.get(m.group(1), ''))),
+        text,
+    )
+
+
+def _substitute_fields_as_js_literal(text, outputParameters):
+    """Replace Field["x"] tokens inside a JS snippet with safe json.dumps() literals.
+
+    The JS("...") feature executes the resulting snippet inside the browser. If
+    scraped Field values are pasted directly into the snippet they can break
+    out of the surrounding string literal and inject arbitrary JS (CWE-95 in
+    the page/extension context). json.dumps produces a JSON string literal
+    that is also a valid, safely-escaped JS string literal.
+    """
+    field_pat = re.compile(r'Field\["([^"]+)"\]')
+    return field_pat.sub(
+        lambda m: json.dumps(str(outputParameters.get(m.group(1), ''))),
+        text,
+    )
+
+
 def replace_field_values(orginal_text, outputParameters, browser=None):
-    pattern = r'Field\["([^"]+)"\]'
+    """Expand Field["x"] / eval("...") / JS("...") templates safely.
+
+    Field["x"] expansions outside of eval()/JS() calls are inserted as plain
+    text. Field["x"] expansions *inside* eval()/JS() calls are inserted as
+    properly escaped Python/JS string literals so that scraped page content
+    cannot escape the surrounding quotes and execute arbitrary code.
+    """
+    field_pattern = r'Field\["([^"]+)"\]'
     try:
+        # Operate on the ORIGINAL template first so we can tell which Field
+        # references live inside eval()/JS() calls (and therefore need to be
+        # escaped as string literals) versus those that are plain text.
+        working_text = orginal_text
+        if re.search(r'eval\(', working_text, re.IGNORECASE):
+            working_text = working_text.replace("self.", "browser.")
+            eval_call_pattern = re.compile(r'(?i)eval\("(.+?)"\)')
+            while True:
+                match = eval_call_pattern.search(working_text)
+                if not match:
+                    break
+                # Substitute Field["x"] inside the eval body using repr() so
+                # that scraped content becomes a safe Python string literal.
+                expr = _substitute_fields_as_python_literal(
+                    match.group(1), outputParameters)
+                eval_replaced_text = str(eval(expr))  # noqa: S307 - documented feature, scraped inputs are escaped above
+                working_text = working_text.replace(
+                    match.group(0), eval_replaced_text)
+        if re.search(r'JS\(', working_text, re.IGNORECASE):
+            working_text = working_text.replace("self.", "browser.")
+            js_call_pattern = re.compile(r'(?i)JS\("(.+?)"\)')
+            while True:
+                match = js_call_pattern.search(working_text)
+                if not match:
+                    break
+                snippet = _substitute_fields_as_js_literal(
+                    match.group(1), outputParameters)
+                JS_replaced_text = str(browser.browser.execute_script(snippet))
+                working_text = working_text.replace(
+                    match.group(0), JS_replaced_text)
+        # Finally expand any remaining Field["x"] tokens as plain text.
         replaced_text = re.sub(
-            pattern, lambda match: outputParameters.get(match.group(1), ''), orginal_text)
-        if re.search(r'eval\(', replaced_text, re.IGNORECASE): # 如果返回值中包含EVAL
-            replaced_text = replaced_text.replace("self.", "browser.")
-            pattern = re.compile(r'(?i)eval\("(.+?)"\)')
-            # 循环替换所有匹配到的eval语句
-            while True:
-                match = pattern.search(replaced_text)
-                if not match:
-                    break
-                # 执行eval并将其结果转换为字符串形式
-                eval_replaced_text = str(eval(match.group(1)))
-                # 替换eval语句
-                replaced_text = replaced_text.replace(match.group(0), eval_replaced_text)
-        if re.search(r'JS\(', replaced_text, re.IGNORECASE): # 如果返回值中包含JS
-            replaced_text = replaced_text.replace("self.", "browser.")
-            pattern = re.compile(r'(?i)JS\("(.+?)"\)')
-            # 循环替换所有匹配到的JS语句
-            while True:
-                match = pattern.search(replaced_text)
-                if not match:
-                    break
-                # 执行JS并将其结果转换为字符串形式
-                JS_replaced_text = str(browser.browser.execute_script(match.group(1)))
-                # 替换JS语句
-                replaced_text = replaced_text.replace(match.group(0), JS_replaced_text)
+            field_pattern,
+            lambda match: str(outputParameters.get(match.group(1), '')),
+            working_text,
+        )
     except Exception as e:
         print("eval替换失败，请检查eval语句是否正确。| Failed to replace eval, please check if the eval statement is correct.")
         print(e)
