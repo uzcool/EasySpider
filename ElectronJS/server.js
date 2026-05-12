@@ -97,7 +97,17 @@ FileMimes = JSON.parse(
 const fileServer = express();
 const upload = multer({ dest: path.join(getDir(), "Data/") });
 
-fileServer.use(cors());
+// SECURITY: Restrict CORS to local origins only to prevent CSRF from malicious
+// websites driving this locally-bound API (CWE-352).
+const LOCAL_ORIGIN_RE = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i;
+fileServer.use(cors({
+  origin: function (origin, callback) {
+    // Allow same-origin / non-browser requests (no Origin header)
+    if (!origin) return callback(null, true);
+    if (LOCAL_ORIGIN_RE.test(origin)) return callback(null, true);
+    return callback(new Error("Origin not allowed"));
+  },
+}));
 fileServer.post("/excelUpload", upload.single("file"), (req, res) => {
   let workbook = XLSX.readFile(req.file.path);
   let sheet_name_list = workbook.SheetNames;
@@ -123,7 +133,7 @@ fileServer.post("/excelUpload", upload.single("file"), (req, res) => {
   res.send(JSON.stringify(result));
 });
 
-fileServer.listen(8075, () => {
+fileServer.listen(8075, "127.0.0.1", () => {
   console.log("Server listening on http://localhost:8075");
 });
 
@@ -202,7 +212,41 @@ exports.start = function (port = 8074) {
   http
     .createServer(function (req, res) {
       let body = "";
-      res.setHeader("Access-Control-Allow-Origin", "*"); // 设置可访问的源
+      // SECURITY (CWE-352): This local HTTP API can spawn child processes
+      // (e.g. /executeTask) and modify on-disk task/config files. It has no
+      // authentication, so a wildcard CORS policy would allow any visited
+      // website to drive it via cross-origin requests. We therefore:
+      //   - never advertise Access-Control-Allow-Origin: *
+      //   - echo the Origin only when it is a local (loopback) origin
+      //   - reject requests with a non-local Origin header outright
+      const reqOrigin = req.headers.origin;
+      const isLocalOrigin = !reqOrigin || LOCAL_ORIGIN_RE.test(reqOrigin);
+      if (reqOrigin && isLocalOrigin) {
+        res.setHeader("Access-Control-Allow-Origin", reqOrigin);
+        res.setHeader("Vary", "Origin");
+        res.setHeader("Access-Control-Allow-Credentials", "true");
+      }
+      if (req.method && req.method.toUpperCase() === "OPTIONS") {
+        res.setHeader(
+          "Access-Control-Allow-Methods",
+          "GET, POST, OPTIONS"
+        );
+        res.setHeader(
+          "Access-Control-Allow-Headers",
+          req.headers["access-control-request-headers"] || "Content-Type"
+        );
+        res.writeHead(isLocalOrigin ? 204 : 403);
+        res.end();
+        return;
+      }
+      if (!isLocalOrigin) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          error: "Cross-origin requests are not allowed.",
+          status: false,
+        }));
+        return;
+      }
       // 解析参数
       const pathName = url.parse(req.url).pathname;
       const safeBase = path.join(__dirname, "src");
@@ -894,6 +938,6 @@ exports.start = function (port = 8074) {
         }
       }, res));
     })
-    .listen(port);
-  console.log("Server has started.");
+    .listen(port, "127.0.0.1");
+  console.log("Server has started on 127.0.0.1:" + port);
 };
